@@ -83,7 +83,7 @@ app = FastAPI(
 # CORS — allow web clients from anywhere (you can lock this down for production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://zerodday-system.vercel.app"],  # your Vercel URL
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
