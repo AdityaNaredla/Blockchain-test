@@ -18,23 +18,31 @@ import { getWsBase } from "./api";
 // (Production deployments would also need a TURN server for symmetric NATs)
 const RTC_CONFIG = {
   iceServers: [
+    { urls: "stun:stun.relay.metered.ca:80" },
     { urls: "stun:stun.l.google.com:19302" },
-    { urls: "stun:stun1.l.google.com:19302" },
-    { urls: "stun:stun.cloudflare.com:3478" },
     {
-      urls: [
-        "turn:global.relay.metered.ca:80",
-        "turn:global.relay.metered.ca:80?transport=tcp",
-        "turn:global.relay.metered.ca:443",
-        "turns:global.relay.metered.ca:443?transport=tcp",
-      ],
-      username: "e8dd65b92c62d3e36cafb807",
-      credential: "uWdWNmkhvyqTEswO",
+      urls: "turn:standard.relay.metered.ca:80",
+      username: "74fdb3f0a2eb7cf22ca2520f",
+      credential: "VG7QXa08nF92POlV",
+    },
+    {
+      urls: "turn:standard.relay.metered.ca:80?transport=tcp",
+      username: "74fdb3f0a2eb7cf22ca2520f",
+      credential: "VG7QXa08nF92POlV",
+    },
+    {
+      urls: "turn:standard.relay.metered.ca:443",
+      username: "74fdb3f0a2eb7cf22ca2520f",
+      credential: "VG7QXa08nF92POlV",
+    },
+    {
+      urls: "turns:standard.relay.metered.ca:443?transport=tcp",
+      username: "74fdb3f0a2eb7cf22ca2520f",
+      credential: "VG7QXa08nF92POlV",
     },
   ],
   iceCandidatePoolSize: 10,
 };
-
 export class PeerManager {
   constructor(userId) {
     this.userId = userId;
