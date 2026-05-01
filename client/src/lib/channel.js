@@ -42,9 +42,22 @@ export class SecureChannel {
     // Hook into the peer manager
     this.peer.handlers.onMessage = (peerId, data) => this._handleData(peerId, data);
     this.peer.handlers.onPeerConnected = (peerId) => {
-      this.log("INFO", `P2P connected with ${peerId}; initiating secure handshake`);
+  this.log("INFO", `P2P connected with ${peerId}; waiting for data channel`);
+  // Wait for the data channel to actually be open before sending HELLO.
+  // 'connected' fires when ICE is done, but the SCTP data channel takes
+  // a few more ms to reach 'open' state.
+  const startedAt = Date.now();
+  const tryHandshake = () => {
+    if (this.peer.isConnected(peerId)) {
       this._initiateHandshake(peerId);
-    };
+    } else if (Date.now() - startedAt < 5000) {
+      setTimeout(tryHandshake, 50);
+    } else {
+      this.log("ERROR", `Data channel never opened for ${peerId}`);
+    }
+  };
+  tryHandshake();
+};
     this.peer.handlers.onPeerDisconnected = (peerId) => {
       this.sessions.delete(peerId);
     };
