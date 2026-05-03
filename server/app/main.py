@@ -301,6 +301,25 @@ async def me(request: Request):
     }
 
 
+@app.post("/api/auth/ws-ticket")
+async def issue_ws_ticket(request: Request):
+    """Issue a short-lived (60s) token for WebSocket authentication.
+
+    Browsers don't always send cookies on cross-site WebSocket upgrades —
+    incognito mode and strict tracking-protection settings block them. The
+    client gets a ticket via authenticated REST (where cookies work) and
+    passes it as ?ticket=... on the WS URL.
+    """
+    user_id = _require_user(request)
+    payload = {
+        "sub": user_id,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 60,  # 60 seconds — used immediately
+        "purpose": "ws",
+    }
+    return {"ticket": jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)}
+
+
 # -------- Public registry endpoints --------
 
 @app.get("/api/health")
@@ -429,19 +448,39 @@ signal_mgr = SignalManager()
 @app.websocket("/ws/signal")
 async def signaling_endpoint(
     ws: WebSocket,
+    ticket: Optional[str] = None,
     zerodday_session: Optional[str] = Cookie(default=None),
 ):
     """Authenticated WebRTC signaling channel.
-    user_id is taken from the session cookie, NOT a URL parameter — so a
-    client cannot impersonate another user just by typing their name."""
-    if not zerodday_session:
+
+    Auth precedence:
+      1. ?ticket=<jwt>  — short-lived ticket from /api/auth/ws-ticket.
+         Used when cross-site cookies are blocked (incognito, strict privacy).
+      2. session cookie — only works when first-party or with cookies allowed.
+
+    user_id is taken from the authenticated token, NOT a URL parameter, so
+    a client cannot impersonate another user just by typing their name."""
+
+    user_id: Optional[str] = None
+
+    # Prefer ticket — it's an explicit, short-lived token issued by us.
+    if ticket:
+        try:
+            payload = jwt.decode(ticket, JWT_SECRET, algorithms=[JWT_ALG])
+            if payload.get("purpose") != "ws":
+                await ws.close(code=4401, reason="Invalid ticket purpose")
+                return
+            user_id = payload.get("sub")
+        except jwt.PyJWTError as e:
+            log.warning(f"WS ticket invalid: {e}")
+            await ws.close(code=4401, reason="Invalid ticket")
+            return
+    elif zerodday_session:
+        user_id = _decode_session_token(zerodday_session)
+
+    if not user_id:
         await ws.close(code=4401, reason="Not authenticated")
         return
-    user_id = _decode_session_token(zerodday_session)
-    if not user_id:
-        await ws.close(code=4401, reason="Invalid session")
-        return
-    # Confirm the user actually exists on the chain
     if not bc.lookup_key(user_id):
         await ws.close(code=4404, reason="User not registered")
         return
