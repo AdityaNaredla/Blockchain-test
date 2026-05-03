@@ -171,13 +171,22 @@ def _decode_session_token(token: str) -> Optional[str]:
 
 
 def _set_session_cookie(response: Response, token: str) -> None:
+    # SameSite=None is required when the client and server are on different
+    # sites (e.g. Vercel client + Railway server). Browsers also require
+    # Secure=true alongside SameSite=None. For local same-origin dev,
+    # SameSite=Lax is friendlier (works without HTTPS).
+    samesite = os.environ.get("COOKIE_SAMESITE", "lax").lower()
+    secure = os.environ.get("COOKIE_SECURE", "0") == "1"
+    if samesite == "none" and not secure:
+        log.warning("COOKIE_SAMESITE=none requires COOKIE_SECURE=1; "
+                    "cookie will be rejected by browsers")
     response.set_cookie(
         key=COOKIE_NAME,
         value=token,
         max_age=SESSION_TTL_SECONDS,
         httponly=True,
-        samesite="lax",
-        secure=os.environ.get("COOKIE_SECURE", "0") == "1",
+        samesite=samesite,
+        secure=secure,
         path="/",
     )
 
