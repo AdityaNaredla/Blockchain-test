@@ -25,6 +25,7 @@ export default function Chat({ identity, onLogout }) {
   const peerRef = useRef(null);
   const channelRef = useRef(null);
   const logEndRef = useRef(null);
+  const threadEndRef = useRef(null);
 
   // ---------- Bring up PeerManager + SecureChannel ----------
   useEffect(() => {
@@ -95,6 +96,12 @@ export default function Chat({ identity, onLogout }) {
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [logs]);
+
+  // ---------- Auto-scroll chat thread when new messages arrive
+  //              or when switching to a different peer ----------
+  useEffect(() => {
+    threadEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [messages.length, activePeer]);
 
   // ---------- Actions ----------
 
@@ -321,6 +328,7 @@ export default function Chat({ identity, onLogout }) {
                     meName={identity.userId}
                     peerName={activePeer} />
                 ))}
+                <div ref={threadEndRef} />
               </div>
 
               {/* Composer */}
