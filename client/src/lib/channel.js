@@ -40,10 +40,21 @@ export class SecureChannel {
     this.peerLookup = null;
 
     // Subscribe to PeerManager events. None of these clobber other listeners.
+    //
+    // We initiate the handshake on `dataChannelOpen`, NOT `peerConnected`.
+    // RTCPeerConnection.connectionState === "connected" only means the ICE
+    // layer is up; the RTCDataChannel.onopen event fires slightly later when
+    // the channel is actually ready for .send(). If we initiate the
+    // handshake on `peerConnected`, the first send throws because the data
+    // channel hasn't opened yet.
     this._unsubscribers = [
       this.peer.on("message", (peerId, data) => this._handleData(peerId, data)),
-      this.peer.on("peerConnected", (peerId) => {
-        this.log("INFO", `P2P connected with ${peerId}; initiating secure handshake`);
+      this.peer.on("dataChannelOpen", (peerId, isInitiator) => {
+        if (!isInitiator) {
+          this.log("INFO", `Data channel open with ${peerId}; awaiting HELLO`);
+          return;
+        }
+        this.log("INFO", `Data channel open with ${peerId}; sending HELLO`);
         this._initiateHandshake(peerId).catch((e) => {
           this.log("ERROR", `Handshake init failed: ${e.message}`);
         });

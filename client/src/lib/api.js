@@ -70,6 +70,13 @@ export async function getMe() {
   return r.user;
 }
 
+/** Get a short-lived (60s) ticket for WebSocket auth. Browsers don't always
+ *  send cookies on cross-site WS upgrades; we put this in the URL instead. */
+export async function fetchWsTicket() {
+  const r = await jsonFetch("/api/auth/ws-ticket", { method: "POST" });
+  return r.ticket;
+}
+
 // ---------- Public registry / chain ----------
 
 export async function lookupUser(userId) {

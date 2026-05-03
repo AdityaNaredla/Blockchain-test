@@ -18,7 +18,7 @@
  *   - userId is no longer in the URL — server reads it from session cookie.
  */
 
-import { getWsBase } from "./api";
+import { getWsBase, fetchWsTicket } from "./api";
 
 const RTC_CONFIG = {
   iceServers: [
@@ -80,9 +80,21 @@ export class PeerManager {
   // ---------- Connection lifecycle ----------
 
   async connect() {
+    // Fetch a short-lived WS ticket via authenticated REST. Cross-site
+    // WebSocket upgrades don't reliably carry cookies (Chrome incognito,
+    // Safari, strict tracking-protection settings all drop them), so we
+    // pass auth in the query string instead.
+    let ticket;
+    try {
+      ticket = await fetchWsTicket();
+    } catch (e) {
+      this.log("ERROR", `Failed to obtain WS ticket: ${e.message}`);
+      throw new Error(`WS ticket failed: ${e.message}`);
+    }
+
     return new Promise((resolve, reject) => {
-      const url = `${getWsBase()}/ws/signal`;
-      this.log("INFO", `Connecting to signaling: ${url}`);
+      const url = `${getWsBase()}/ws/signal?ticket=${encodeURIComponent(ticket)}`;
+      this.log("INFO", `Connecting to signaling: ${url.replace(/ticket=[^&]+/, "ticket=***")}`);
       try {
         this.ws = new WebSocket(url);
       } catch (e) {
@@ -192,7 +204,7 @@ export class PeerManager {
       this._wireDataChannel(peerId, dc);
     }
 
-    const peer = { pc, dc, ready: false };
+    const peer = { pc, dc, ready: false, isInitiator };
     this.peers.set(peerId, peer);
     return peer;
   }
@@ -204,7 +216,9 @@ export class PeerManager {
     dc.onopen = () => {
       this.log("INFO", `[${peerId}] P2P data channel OPEN — direct browser-to-browser`);
       if (peer) peer.ready = true;
-      this.emit("dataChannelOpen", peerId);
+      // Emit role so SecureChannel knows whether to initiate the handshake
+      // (only the caller sends HELLO; the receiver waits for it).
+      this.emit("dataChannelOpen", peerId, peer?.isInitiator ?? false);
     };
     dc.onclose = () => {
       this.log("INFO", `[${peerId}] data channel closed`);
