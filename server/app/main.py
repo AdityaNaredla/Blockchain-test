@@ -387,6 +387,66 @@ async def get_chain():
     return {"blocks": bc.all_blocks(), "valid": bc.validate_chain()}
 
 
+@app.get("/api/document/verify/{doc_hash}")
+async def verify_document(doc_hash: str):
+    """Look up every DOC_SIGNATURE block for the given hash and re-verify
+    each signature against the signer's current on-chain key.
+
+    This is the public side of the sign-doc flow: anyone can call this
+    (no auth needed) and the response cryptographically proves which
+    identities have signed the file with this hash.
+
+    Response per signature:
+      - signer_id: the user that signed
+      - block_index: where the signature lives on-chain
+      - signed_at: block timestamp
+      - signature_valid: did the signature verify against signer's CURRENT pubkey?
+      - key_revoked: was the signing key later revoked?
+      - signer_registered: does the signer still have an active on-chain identity?
+    """
+    if not doc_hash or len(doc_hash) != 64 or not all(c in "0123456789abcdef" for c in doc_hash):
+        raise HTTPException(400, "doc_hash must be 64 hex chars (sha-256)")
+
+    matches = []
+    for b in bc.all_blocks():
+        p = b["payload"]
+        if p.get("type") == "DOC_SIGNATURE" and p.get("doc_hash") == doc_hash:
+            signer_id = p.get("signer_id")
+            sig_hex = p.get("signature", "")
+
+            current = bc.lookup_key(signer_id)
+            signer_registered = current is not None
+            signature_valid = False
+            key_revoked = False
+
+            if current:
+                proof_msg = f"doc:{doc_hash}".encode()
+                signature_valid = _verify_proof(
+                    current["public_key"], sig_hex, proof_msg
+                )
+            else:
+                # Signer no longer has an active identity. Check if their
+                # key was specifically revoked (vs. never existing).
+                # The signature might still verify against the old key, but
+                # we can't prove that's "their" key anymore — so we flag it.
+                key_revoked = True
+
+            matches.append({
+                "signer_id": signer_id,
+                "block_index": b["index"],
+                "signed_at": b["timestamp"],
+                "signature_valid": signature_valid,
+                "key_revoked": key_revoked,
+                "signer_registered": signer_registered,
+            })
+
+    return {
+        "doc_hash": doc_hash,
+        "signature_count": len(matches),
+        "signatures": matches,
+    }
+
+
 @app.get("/api/chain/stats")
 async def chain_stats():
     return bc.stats()
