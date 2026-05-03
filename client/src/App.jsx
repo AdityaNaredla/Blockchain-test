@@ -4,6 +4,7 @@ import Login from "./pages/Login";
 import Register from "./pages/Register";
 import Chat from "./pages/Chat";
 import Registry from "./pages/Registry";
+import Verify from "./pages/Verify";
 import { getMe } from "./lib/api";
 import {
   loadStashedIdentity,
@@ -86,6 +87,7 @@ export default function App() {
         }
       />
       <Route path="/registry" element={<Registry />} />
+      <Route path="/verify" element={<Verify />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

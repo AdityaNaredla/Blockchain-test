@@ -54,11 +54,16 @@ export function AuthShell({ title, caption, children }) {
           {children}
         </div>
 
-        <div className="mt-12 max-w-sm w-full mx-auto lg:mx-0 text-[11px] text-dim/70 flex justify-between">
+        <div className="mt-12 max-w-sm w-full mx-auto lg:mx-0 text-[11px] text-dim/70 flex justify-between gap-4">
           <span>// secure channel</span>
-          <Link to="/registry" className="hover:text-phosphor transition-colors">
-            view registry →
-          </Link>
+          <div className="flex gap-3">
+            <Link to="/verify" className="hover:text-phosphor transition-colors">
+              verify doc →
+            </Link>
+            <Link to="/registry" className="hover:text-phosphor transition-colors">
+              registry →
+            </Link>
+          </div>
         </div>
       </div>
     </div>

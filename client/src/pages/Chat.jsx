@@ -193,6 +193,7 @@ export default function Chat({ identity, onLogout }) {
               </span>
             </button>
             <Link to="/registry" className="btn-ghost hidden sm:inline-flex">registry</Link>
+            <Link to="/verify" className="btn-ghost hidden sm:inline-flex">verify</Link>
             <button onClick={handleLogout} className="btn-danger">logout</button>
           </div>
         </div>
@@ -268,6 +269,12 @@ export default function Chat({ identity, onLogout }) {
                       {docResult.hash.slice(0, 16)}…
                     </div>
                     <div className="opacity-70">block #{docResult.block}</div>
+                    <Link
+                      to="/verify"
+                      className="block mt-2 pt-2 border-t border-phosphor/30 text-phosphor hover:text-ink transition-colors"
+                    >
+                      verify this signature →
+                    </Link>
                   </>
                 ) : (
                   <div>error: {docResult.error}</div>

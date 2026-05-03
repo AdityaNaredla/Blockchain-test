@@ -105,6 +105,12 @@ export async function logDocumentSignature(docHashHex, identity) {
   });
 }
 
+/** Public — no auth required. Returns all signatures for a hash with
+ *  re-verified status. Use this to prove "@alice signed this file".  */
+export async function verifyDocumentHash(docHashHex) {
+  return jsonFetch(`/api/document/verify/${encodeURIComponent(docHashHex)}`);
+}
+
 // ---------- Revoke ----------
 
 export async function revokeKey(identity) {
