@@ -195,34 +195,40 @@ export class PeerManager {
     };
 
     pc.ondatachannel = (e) => {
-      this._wireDataChannel(peerId, e.channel);
+      // We're the responder — caller created the channel.
+      this._wireDataChannel(peerId, e.channel, false);
     };
 
-    let dc = null;
+    // Insert into peers map BEFORE wiring the channel, so that the peer
+    // record is visible to _wireDataChannel's closure when dc.onopen fires.
+    const peer = { pc, dc: null, ready: false, isInitiator };
+    this.peers.set(peerId, peer);
+
     if (isInitiator) {
-      dc = pc.createDataChannel("zerodday-msg", { ordered: true });
-      this._wireDataChannel(peerId, dc);
+      const dc = pc.createDataChannel("zerodday-msg", { ordered: true });
+      peer.dc = dc;
+      this._wireDataChannel(peerId, dc, true);
     }
 
-    const peer = { pc, dc, ready: false, isInitiator };
-    this.peers.set(peerId, peer);
     return peer;
   }
 
-  _wireDataChannel(peerId, dc) {
+  _wireDataChannel(peerId, dc, isInitiator) {
     const peer = this.peers.get(peerId);
     if (peer) peer.dc = dc;
 
     dc.onopen = () => {
       this.log("INFO", `[${peerId}] P2P data channel OPEN — direct browser-to-browser`);
-      if (peer) peer.ready = true;
+      const p = this.peers.get(peerId);
+      if (p) p.ready = true;
       // Emit role so SecureChannel knows whether to initiate the handshake
       // (only the caller sends HELLO; the receiver waits for it).
-      this.emit("dataChannelOpen", peerId, peer?.isInitiator ?? false);
+      this.emit("dataChannelOpen", peerId, isInitiator);
     };
     dc.onclose = () => {
       this.log("INFO", `[${peerId}] data channel closed`);
-      if (peer) peer.ready = false;
+      const p = this.peers.get(peerId);
+      if (p) p.ready = false;
     };
     dc.onmessage = (ev) => {
       try {
