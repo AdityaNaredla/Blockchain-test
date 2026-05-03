@@ -6,7 +6,12 @@
  *   4. Monotonic sequence numbers for replay protection
  *
  * Public key trust comes from the blockchain registry (lookupUser).
- * Once handshake completes, all chat messages are authenticated AEAD-encrypted.
+ * Once handshake completes, all chat messages are AEAD-encrypted.
+ *
+ * Changes from v0.1:
+ *   - Subscribes to PeerManager events with pm.on() instead of overwriting
+ *     pm.handlers.* — multiple consumers (App + this) can now coexist.
+ *   - Uses its own multi-listener event bus (same shape as PeerManager).
  */
 
 import {
@@ -30,53 +35,76 @@ export class SecureChannel {
   constructor(peerManager, identity) {
     this.peer = peerManager;
     this.identity = identity;
-    // peerId -> session state
-    this.sessions = new Map();
-    this.handlers = {
-      onSecureMessage: () => {},
-      onHandshakeComplete: () => {},
-      onLog: () => {},
-      onSecurityEvent: () => {},
-    };
+    this.sessions = new Map(); // peerId -> session state
+    this.listeners = new Map(); // event -> Set<fn>
+    this.peerLookup = null;
 
-    // Hook into the peer manager
-    this.peer.handlers.onMessage = (peerId, data) => this._handleData(peerId, data);
-    this.peer.handlers.onPeerConnected = (peerId) => {
-  this.log("INFO", `P2P connected with ${peerId}; initiating secure handshake`);
-  this._initiateHandshake(peerId);
-};
-    this.peer.handlers.onPeerDisconnected = (peerId) => {
-      this.sessions.delete(peerId);
-    };
+    // Subscribe to PeerManager events. None of these clobber other listeners.
+    this._unsubscribers = [
+      this.peer.on("message", (peerId, data) => this._handleData(peerId, data)),
+      this.peer.on("peerConnected", (peerId) => {
+        this.log("INFO", `P2P connected with ${peerId}; initiating secure handshake`);
+        this._initiateHandshake(peerId).catch((e) => {
+          this.log("ERROR", `Handshake init failed: ${e.message}`);
+        });
+      }),
+      this.peer.on("peerDisconnected", (peerId) => {
+        this.sessions.delete(peerId);
+      }),
+    ];
   }
 
+  destroy() {
+    for (const u of this._unsubscribers) u();
+    this._unsubscribers = [];
+    this.sessions.clear();
+  }
+
+  // ---------- Event bus ----------
+
   on(event, fn) {
-    const key = `on${event[0].toUpperCase()}${event.slice(1)}`;
-    if (key in this.handlers) this.handlers[key] = fn;
+    if (!this.listeners.has(event)) this.listeners.set(event, new Set());
+    this.listeners.get(event).add(fn);
+    return () => this.off(event, fn);
+  }
+
+  off(event, fn) {
+    this.listeners.get(event)?.delete(fn);
+  }
+
+  emit(event, ...args) {
+    const set = this.listeners.get(event);
+    if (!set) return;
+    for (const fn of set) {
+      try { fn(...args); } catch (e) {
+        console.error(`[SecureChannel] listener for '${event}' threw:`, e);
+      }
+    }
   }
 
   log(level, msg, detail) {
-    this.handlers.onLog({ level, msg, detail, time: new Date() });
+    this.emit("log", { level, msg, detail, time: new Date() });
   }
 
-  /**
-   * peerLookup: a function (peerId) => { public_key: hex } | null
-   * Used to verify the peer's identity during handshake.
-   */
+  /** peerLookup: async (peerId) => { public_key: hex } | null */
   setPeerLookup(fn) {
     this.peerLookup = fn;
   }
 
-  // ---------- Handshake flow ----------
+  // ---------- Handshake (X25519 + Ed25519 signature, registry-checked) ----------
 
   async _initiateHandshake(peerId) {
-    // Initiator (the one who called) sends HELLO with ephemeral pk + sig
+    if (this.sessions.has(peerId)) {
+      // Already handshook or in progress
+      return;
+    }
     const eph = generateEphemeralKey();
     const sigPayload = enc.encode(`hs:${this.peer.userId}:${peerId}`);
-    const sig = signMessage(this.identity.secretKey, this._concat(sigPayload, eph.publicKey));
+    const sig = signMessage(this.identity.secretKey,
+                            this._concat(sigPayload, eph.publicKey));
 
     this.sessions.set(peerId, {
-      state: "AWAITING_HELLO",
+      state: "AWAITING_HELLO_ACK",
       ephSecret: eph.secretKey,
       ephPublic: eph.publicKey,
       sendSeq: 0,
@@ -96,38 +124,39 @@ export class SecureChannel {
   }
 
   async _handleHello(peerId, msg) {
-    // Receiver: verify sender's identity, generate own ephemeral, respond
     if (!this.peerLookup) {
       this.log("ERROR", "No peer lookup set, cannot verify identity");
       return;
     }
 
-    // Verify peer's identity key matches what's on the blockchain
+    // 1. Verify peer's identity matches the on-chain registry
     const onchain = await this.peerLookup(peerId);
     if (!onchain || onchain.public_key !== msg.identityPk) {
-      this.log("CRITICAL", `MITM_DETECTED: identity key for ${peerId} does not match blockchain`);
-      this.handlers.onSecurityEvent("MITM_DETECTED", { peer: peerId });
+      this.log("CRITICAL", `MITM_DETECTED: identity key for ${peerId} does not match registry`);
+      this.emit("securityEvent", "MITM_DETECTED", { peer: peerId });
       return;
     }
 
-    // Verify signature
+    // 2. Verify peer's signature on their ephemeral pubkey
     const peerIdentityPk = hexToBytes(msg.identityPk);
     const peerEphPk = hexToBytes(msg.ephPublic);
     const sigPayload = enc.encode(`hs:${peerId}:${this.peer.userId}`);
     const expected = this._concat(sigPayload, peerEphPk);
     if (!verifySignature(peerIdentityPk, expected, hexToBytes(msg.sig))) {
       this.log("CRITICAL", `SIG_INVALID from ${peerId}; aborting handshake`);
-      this.handlers.onSecurityEvent("SIG_INVALID", { peer: peerId });
+      this.emit("securityEvent", "SIG_INVALID", { peer: peerId });
       return;
     }
 
-    // Generate our ephemeral, derive session keys
+    // 3. Generate own ephemeral, derive session key from shared secret
     const eph = generateEphemeralKey();
     const shared = computeSharedSecret(eph.secretKey, peerEphPk);
     const session = await deriveSessionKey(shared);
 
+    // 4. Sign our own ephemeral and send HELLO_ACK
     const sigPayload2 = enc.encode(`hs:${this.peer.userId}:${peerId}`);
-    const sig = signMessage(this.identity.secretKey, this._concat(sigPayload2, eph.publicKey));
+    const sig = signMessage(this.identity.secretKey,
+                            this._concat(sigPayload2, eph.publicKey));
 
     this.sessions.set(peerId, {
       state: "ESTABLISHED",
@@ -136,7 +165,7 @@ export class SecureChannel {
       sendSeq: 0,
       recvSeq: -1,
       role: "responder",
-      peerIdentityPk: peerIdentityPk,
+      peerIdentityPk,
     });
 
     this.peer.send(peerId, {
@@ -148,17 +177,17 @@ export class SecureChannel {
     });
 
     this.log("INFO", `Handshake complete with ${peerId} (responder)`);
-    this.handlers.onHandshakeComplete(peerId);
+    this.emit("handshakeComplete", peerId);
   }
 
   async _handleHelloAck(peerId, msg) {
     const sess = this.sessions.get(peerId);
-    if (!sess || sess.state !== "AWAITING_HELLO") return;
+    if (!sess || sess.state !== "AWAITING_HELLO_ACK") return;
 
     const onchain = await this.peerLookup(peerId);
     if (!onchain || onchain.public_key !== msg.identityPk) {
       this.log("CRITICAL", `MITM_DETECTED: identity key mismatch for ${peerId}`);
-      this.handlers.onSecurityEvent("MITM_DETECTED", { peer: peerId });
+      this.emit("securityEvent", "MITM_DETECTED", { peer: peerId });
       return;
     }
 
@@ -168,7 +197,7 @@ export class SecureChannel {
     const expected = this._concat(sigPayload, peerEphPk);
     if (!verifySignature(peerIdentityPk, expected, hexToBytes(msg.sig))) {
       this.log("CRITICAL", `SIG_INVALID from ${peerId}`);
-      this.handlers.onSecurityEvent("SIG_INVALID", { peer: peerId });
+      this.emit("securityEvent", "SIG_INVALID", { peer: peerId });
       return;
     }
 
@@ -179,33 +208,31 @@ export class SecureChannel {
     sess.sessionKey = session.key;
     sess.baseNonce = session.baseNonce;
     sess.peerIdentityPk = peerIdentityPk;
-    // Zero ephemeral
+    // Zero out ephemerals — forward secrecy
     sess.ephSecret = null;
     sess.ephPublic = null;
 
     this.log("INFO", `Handshake complete with ${peerId} (initiator)`);
-    this.handlers.onHandshakeComplete(peerId);
+    this.emit("handshakeComplete", peerId);
   }
 
-  // ---------- Message send/receive ----------
+  // ---------- Application messages ----------
 
   async sendMessage(peerId, plaintext) {
     const sess = this.sessions.get(peerId);
     if (!sess || sess.state !== "ESTABLISHED") {
       throw new Error(`No secure session with ${peerId}`);
     }
-
     const seq = sess.sendSeq++;
     const aad = `${this.peer.userId}->${peerId}:${seq}`;
-    const ct = await encryptMessage(sess.sessionKey, sess.baseNonce, seq, plaintext, aad);
-
+    const ct = await encryptMessage(sess.sessionKey, sess.baseNonce, seq,
+                                    plaintext, aad);
     this.peer.send(peerId, {
       type: "MSG",
       from: this.peer.userId,
       seq,
       ct: bytesToBase64(ct),
     });
-
     return { seq, size: plaintext.length };
   }
 
@@ -218,21 +245,24 @@ export class SecureChannel {
 
     const seq = msg.seq;
     if (seq <= sess.recvSeq) {
-      this.log("CRITICAL", `REPLAY_DETECTED from ${peerId}: seq=${seq} <= last=${sess.recvSeq}`);
-      this.handlers.onSecurityEvent("REPLAY_DETECTED", { peer: peerId, seq });
+      this.log("CRITICAL",
+        `REPLAY_DETECTED from ${peerId}: seq=${seq} <= last=${sess.recvSeq}`);
+      this.emit("securityEvent", "REPLAY_DETECTED", { peer: peerId, seq });
       return;
     }
 
     try {
       const ct = base64ToBytes(msg.ct);
       const aad = `${peerId}->${this.peer.userId}:${seq}`;
-      const pt = await decryptMessage(sess.sessionKey, sess.baseNonce, seq, ct, aad);
+      const pt = await decryptMessage(sess.sessionKey, sess.baseNonce, seq,
+                                       ct, aad);
       sess.recvSeq = seq;
       const text = bytesToString(pt);
-      this.handlers.onSecureMessage({ from: peerId, text, seq });
+      this.emit("secureMessage", { from: peerId, text, seq });
     } catch (e) {
-      this.log("CRITICAL", `TAMPER_DETECTED from ${peerId}: GCM auth failed`, e.message);
-      this.handlers.onSecurityEvent("TAMPER_DETECTED", { peer: peerId, seq });
+      this.log("CRITICAL", `TAMPER_DETECTED from ${peerId}: GCM auth failed`,
+               e.message);
+      this.emit("securityEvent", "TAMPER_DETECTED", { peer: peerId, seq });
     }
   }
 

@@ -1,0 +1,112 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body, #root {
+  height: 100%;
+  background: #0a0e0a;
+  color: #c8e6c8;
+  font-family: 'JetBrains Mono', monospace;
+  font-feature-settings: "ss01", "ss02", "calt" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Subtle phosphor grain over everything */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  opacity: 0.035;
+  mix-blend-mode: screen;
+  background-image: repeating-linear-gradient(
+    0deg, transparent 0, transparent 2px,
+    rgba(95, 255, 138, 0.4) 2px, rgba(95, 255, 138, 0.4) 3px
+  );
+}
+
+/* Vignette */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 99;
+  background: radial-gradient(ellipse at center, transparent 40%, rgba(0,0,0,0.5) 100%);
+}
+
+::selection {
+  background: rgba(95, 255, 138, 0.3);
+  color: #fff;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1a2a1a; }
+::-webkit-scrollbar-thumb:hover { background: #2a4a2a; }
+
+@layer components {
+  .panel {
+    @apply bg-panel border border-border;
+  }
+  .field {
+    @apply w-full bg-bg border border-border px-3 py-2.5 font-mono text-sm text-ink
+           outline-none transition-colors
+           focus:border-phosphor placeholder:text-dim;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 px-4 py-2.5
+           border border-phosphor bg-phosphor/10 text-phosphor font-mono text-sm uppercase tracking-wider
+           transition-all hover:bg-phosphor/20 hover:shadow-[0_0_20px_rgba(95,255,138,0.3)]
+           disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:shadow-none;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-2
+           border border-border bg-transparent text-dim font-mono text-xs uppercase tracking-wider
+           transition-colors hover:border-ink hover:text-ink;
+  }
+  .btn-danger {
+    @apply inline-flex items-center justify-center gap-2 px-3 py-2
+           border border-crimson/50 bg-transparent text-crimson font-mono text-xs uppercase tracking-wider
+           transition-colors hover:bg-crimson/10;
+  }
+  .label {
+    @apply block text-xs uppercase tracking-[0.2em] text-dim mb-2;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1.5 px-2 py-0.5 text-[10px] uppercase tracking-wider
+           border border-border bg-bg text-dim;
+  }
+  .panel-header {
+    @apply flex items-center justify-between px-4 py-2.5 border-b border-border;
+  }
+  .panel-title {
+    @apply text-[10px] uppercase tracking-[0.25em] text-dim;
+  }
+}
+
+.caret::after {
+  content: "▮";
+  margin-left: 2px;
+  animation: blink 1.1s steps(2) infinite;
+  color: #5fff8a;
+}
+
+.scanlines {
+  position: relative;
+  overflow: hidden;
+}
+.scanlines::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent 0%, rgba(95,255,138,0.06) 50%, transparent 100%);
+  height: 30%;
+  animation: scan 6s linear infinite;
+  pointer-events: none;
+}

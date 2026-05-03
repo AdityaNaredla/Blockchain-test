@@ -2,89 +2,113 @@
  * WebRTC peer connection manager.
  *
  * Flow:
- *   1. Connect to signaling WebSocket (/ws/signal/{userId})
+ *   1. Connect to authenticated signaling WebSocket (/ws/signal — cookie auth)
  *   2. To call peer: create RTCPeerConnection, generate offer, send via signaling
  *   3. Peer receives offer, generates answer, sends back
- *   4. Both exchange ICE candidates via signaling
+ *   4. Both exchange ICE candidates
  *   5. Once connected, RTCDataChannel handles encrypted messages directly P2P
  *
- * Server only sees signaling (SDP offers/answers, ICE candidates).
- * After connection, all chat is browser-to-browser. Server never sees plaintext.
+ * Server only sees signaling (SDP, ICE). After connection, all chat is P2P.
+ *
+ * Changes from v0.1:
+ *   - Multi-listener event bus (`on`/`off`/`emit`) instead of single-handler
+ *     slots. The old design let SecureChannel clobber App's handlers. Now
+ *     both can subscribe to the same event independently.
+ *   - WS send queue: sends before `onopen` are buffered, not silently dropped.
+ *   - userId is no longer in the URL — server reads it from session cookie.
  */
 
 import { getWsBase } from "./api";
 
-// Use Google's public STUN server for NAT traversal
-// (Production deployments would also need a TURN server for symmetric NATs)
 const RTC_CONFIG = {
   iceServers: [
-    { urls: "stun:stun.relay.metered.ca:80" },
     { urls: "stun:stun.l.google.com:19302" },
-    {
-      urls: "turn:standard.relay.metered.ca:80",
-      username: "74fdb3f0a2eb7cf22ca2520f",
-      credential: "VG7QXa08nF92POlV",
-    },
-    {
-      urls: "turn:standard.relay.metered.ca:80?transport=tcp",
-      username: "74fdb3f0a2eb7cf22ca2520f",
-      credential: "VG7QXa08nF92POlV",
-    },
-    {
-      urls: "turn:standard.relay.metered.ca:443",
-      username: "74fdb3f0a2eb7cf22ca2520f",
-      credential: "VG7QXa08nF92POlV",
-    },
-    {
-      urls: "turns:standard.relay.metered.ca:443?transport=tcp",
-      username: "74fdb3f0a2eb7cf22ca2520f",
-      credential: "VG7QXa08nF92POlV",
-    },
+    { urls: "stun:stun.relay.metered.ca:80" },
+    // TURN credentials should come from env or a server-issued token, NOT
+    // be hardcoded in source. Provide via VITE_TURN_URL etc. if needed.
   ],
   iceCandidatePoolSize: 10,
 };
+
+// Optional TURN config from environment
+if (import.meta.env.VITE_TURN_URL && import.meta.env.VITE_TURN_USERNAME) {
+  RTC_CONFIG.iceServers.push({
+    urls: import.meta.env.VITE_TURN_URL,
+    username: import.meta.env.VITE_TURN_USERNAME,
+    credential: import.meta.env.VITE_TURN_CREDENTIAL,
+  });
+}
+
+
 export class PeerManager {
   constructor(userId) {
     this.userId = userId;
     this.ws = null;
     this.peers = new Map(); // peerId -> { pc, dc, ready }
-    this.handlers = {
-      onPresence: () => {},
-      onMessage: () => {},
-      onPeerConnected: () => {},
-      onPeerDisconnected: () => {},
-      onLog: () => {},
-      onSignal: () => {},
-    };
+    this.listeners = new Map(); // event -> Set<fn>
+    this.outQueue = []; // signals queued before WS opens
+    this.wsOpen = false;
   }
 
+  // ---------- Multi-listener event bus ----------
+
   on(event, fn) {
-    const key = `on${event[0].toUpperCase()}${event.slice(1)}`;
-    if (key in this.handlers) this.handlers[key] = fn;
+    if (!this.listeners.has(event)) this.listeners.set(event, new Set());
+    this.listeners.get(event).add(fn);
+    return () => this.off(event, fn);
+  }
+
+  off(event, fn) {
+    this.listeners.get(event)?.delete(fn);
+  }
+
+  emit(event, ...args) {
+    const set = this.listeners.get(event);
+    if (!set) return;
+    for (const fn of set) {
+      try { fn(...args); } catch (e) {
+        // One bad listener shouldn't break the others.
+        console.error(`[PeerManager] listener for '${event}' threw:`, e);
+      }
+    }
   }
 
   log(level, msg, detail) {
-    this.handlers.onLog({ level, msg, detail, time: new Date() });
+    this.emit("log", { level, msg, detail, time: new Date() });
   }
+
+  // ---------- Connection lifecycle ----------
 
   async connect() {
     return new Promise((resolve, reject) => {
-      const url = `${getWsBase()}/ws/signal/${encodeURIComponent(this.userId)}`;
+      const url = `${getWsBase()}/ws/signal`;
       this.log("INFO", `Connecting to signaling: ${url}`);
-      this.ws = new WebSocket(url);
+      try {
+        this.ws = new WebSocket(url);
+      } catch (e) {
+        return reject(e);
+      }
 
       this.ws.onopen = () => {
+        this.wsOpen = true;
         this.log("INFO", "Signaling channel connected");
+        // Drain queued sends
+        while (this.outQueue.length) {
+          this.ws.send(JSON.stringify(this.outQueue.shift()));
+        }
         resolve();
       };
 
       this.ws.onerror = (e) => {
-        this.log("ERROR", "Signaling WebSocket error", e.message || "connection failed");
-        reject(new Error("WebSocket failed"));
+        this.log("ERROR", "Signaling WebSocket error",
+                 e.message || "connection failed");
+        if (!this.wsOpen) reject(new Error("WebSocket failed"));
       };
 
-      this.ws.onclose = () => {
-        this.log("WARN", "Signaling channel closed");
+      this.ws.onclose = (ev) => {
+        this.wsOpen = false;
+        this.log("WARN", `Signaling channel closed (code=${ev.code})`);
+        this.emit("signalingClosed", ev);
       };
 
       this.ws.onmessage = async (ev) => {
@@ -99,13 +123,12 @@ export class PeerManager {
   }
 
   async _handleSignal(msg) {
-    this.handlers.onSignal(msg);
+    this.emit("signal", msg);
 
     if (msg.type === "presence") {
-      this.handlers.onPresence(msg.users);
+      this.emit("presence", msg.users);
       return;
     }
-
     if (msg.type === "pong") return;
 
     const peerId = msg.from;
@@ -126,11 +149,16 @@ export class PeerManager {
     }
   }
 
+  /** Send to signaling server. Queues if WS not yet open. */
   _send(payload) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.wsOpen && this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(payload));
+    } else {
+      this.outQueue.push(payload);
     }
   }
+
+  // ---------- WebRTC peer setup ----------
 
   _createPeerConnection(peerId, isInitiator) {
     const pc = new RTCPeerConnection(RTC_CONFIG);
@@ -144,18 +172,17 @@ export class PeerManager {
     pc.onconnectionstatechange = () => {
       this.log("INFO", `[${peerId}] connection state: ${pc.connectionState}`);
       if (pc.connectionState === "connected") {
-        this.handlers.onPeerConnected(peerId);
+        this.emit("peerConnected", peerId);
       } else if (
         pc.connectionState === "disconnected" ||
         pc.connectionState === "failed" ||
         pc.connectionState === "closed"
       ) {
-        this.handlers.onPeerDisconnected(peerId);
+        this.emit("peerDisconnected", peerId);
       }
     };
 
     pc.ondatachannel = (e) => {
-      // Receiving side gets the data channel here
       this._wireDataChannel(peerId, e.channel);
     };
 
@@ -177,6 +204,7 @@ export class PeerManager {
     dc.onopen = () => {
       this.log("INFO", `[${peerId}] P2P data channel OPEN — direct browser-to-browser`);
       if (peer) peer.ready = true;
+      this.emit("dataChannelOpen", peerId);
     };
     dc.onclose = () => {
       this.log("INFO", `[${peerId}] data channel closed`);
@@ -185,7 +213,7 @@ export class PeerManager {
     dc.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
-        this.handlers.onMessage(peerId, data);
+        this.emit("message", peerId, data);
       } catch (e) {
         this.log("ERROR", `Bad message from ${peerId}`, e.message);
       }
@@ -206,7 +234,6 @@ export class PeerManager {
 
   async _handleOffer(peerId, sdp) {
     if (this.peers.has(peerId)) {
-      // Glare — tear down existing
       this._teardownPeer(peerId);
     }
     const { pc } = this._createPeerConnection(peerId, false);
@@ -235,12 +262,9 @@ export class PeerManager {
   _teardownPeer(peerId) {
     const peer = this.peers.get(peerId);
     if (!peer) return;
-    try {
-      peer.dc?.close();
-      peer.pc.close();
-    } catch {}
+    try { peer.dc?.close(); peer.pc.close(); } catch {}
     this.peers.delete(peerId);
-    this.handlers.onPeerDisconnected(peerId);
+    this.emit("peerDisconnected", peerId);
   }
 
   send(peerId, payload) {
@@ -252,8 +276,7 @@ export class PeerManager {
   }
 
   isConnected(peerId) {
-    const peer = this.peers.get(peerId);
-    return !!peer?.ready;
+    return !!this.peers.get(peerId)?.ready;
   }
 
   hangup(peerId) {
@@ -265,9 +288,7 @@ export class PeerManager {
     for (const peerId of Array.from(this.peers.keys())) {
       this._teardownPeer(peerId);
     }
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
-    }
+    if (this.ws) { this.ws.close(); this.ws = null; }
+    this.wsOpen = false;
   }
 }

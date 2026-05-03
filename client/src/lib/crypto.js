@@ -1,14 +1,12 @@
 /**
  * ZeroDay browser crypto library
  *
- * Uses native Web Crypto API where possible. For Ed25519 we use tweetnacl
- * because Web Crypto Ed25519 support is still limited across browsers.
- *
  * Primitives:
  *   - Ed25519 (tweetnacl) for identity signatures
  *   - X25519 (tweetnacl) for ephemeral key exchange
  *   - HKDF-SHA256 (Web Crypto) for session key derivation
  *   - AES-256-GCM (Web Crypto) for AEAD encryption
+ *   - PBKDF2-SHA256 + AES-GCM (Web Crypto) for password-wrapped secret keys
  *   - SHA-256 (Web Crypto) for document hashing
  */
 
@@ -17,7 +15,7 @@ import nacl from "tweetnacl";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-// ---------- Hex encoding helpers ----------
+// ---------- Hex / base64 helpers ----------
 
 export function bytesToHex(bytes) {
   return Array.from(bytes)
@@ -35,31 +33,30 @@ export function hexToBytes(hex) {
 }
 
 export function bytesToBase64(bytes) {
-  return btoa(String.fromCharCode(...bytes));
+  let s = "";
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
 }
 
 export function base64ToBytes(b64) {
-  return new Uint8Array(
-    atob(b64)
-      .split("")
-      .map((c) => c.charCodeAt(0))
-  );
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
 }
 
 // ---------- Ed25519 identity keys ----------
 
 export function generateIdentityKey() {
-  // tweetnacl uses a 64-byte secretKey (seed + public) and 32-byte publicKey
   const kp = nacl.sign.keyPair();
   return {
-    secretKey: kp.secretKey, // 64 bytes
+    secretKey: kp.secretKey, // 64 bytes (seed + pub)
     publicKey: kp.publicKey, // 32 bytes
     publicKeyHex: bytesToHex(kp.publicKey),
   };
 }
 
 export function signMessage(secretKey, message) {
-  // Returns 64-byte signature
   return nacl.sign.detached(message, secretKey);
 }
 
@@ -85,7 +82,7 @@ export function computeSharedSecret(mySecret, theirPublic) {
   return nacl.scalarMult(mySecret, theirPublic);
 }
 
-// ---------- HKDF-SHA256 ----------
+// ---------- HKDF-SHA256 (session keys) ----------
 
 const PROTOCOL_SALT = enc.encode("ZeroDay-v1-salt");
 
@@ -103,7 +100,7 @@ export async function deriveSessionKey(sharedSecret) {
       info: enc.encode("zeroday-session-key"),
     },
     baseKey,
-    256 // 32 bytes
+    256
   );
   const nonceBits = await crypto.subtle.deriveBits(
     {
@@ -113,7 +110,7 @@ export async function deriveSessionKey(sharedSecret) {
       info: enc.encode("zeroday-base-nonce"),
     },
     baseKey,
-    96 // 12 bytes
+    96
   );
   return {
     key: new Uint8Array(keyBits),
@@ -121,23 +118,18 @@ export async function deriveSessionKey(sharedSecret) {
   };
 }
 
-// ---------- AES-256-GCM ----------
+// ---------- AES-256-GCM (per-message AEAD) ----------
 
 async function importAESKey(rawKey) {
   return crypto.subtle.importKey("raw", rawKey, { name: "AES-GCM" }, false, [
-    "encrypt",
-    "decrypt",
+    "encrypt", "decrypt",
   ]);
 }
 
 function buildNonce(baseNonce, seq) {
-  // Nonce = baseNonce XOR seq (12 bytes, big-endian seq)
   const nonce = new Uint8Array(12);
-  // Last 4 bytes carry seq (32-bit), XOR with base
   const seqBytes = new Uint8Array(12);
-  // Pack seq as big-endian into the last bytes
-  const view = new DataView(seqBytes.buffer);
-  view.setUint32(8, seq, false); // false = big endian
+  new DataView(seqBytes.buffer).setUint32(8, seq, false);
   for (let i = 0; i < 12; i++) nonce[i] = baseNonce[i] ^ seqBytes[i];
   return nonce;
 }
@@ -146,27 +138,29 @@ export async function encryptMessage(sessionKey, baseNonce, seq, plaintext, aad)
   const key = await importAESKey(sessionKey);
   const nonce = buildNonce(baseNonce, seq);
   const ptBytes = typeof plaintext === "string" ? enc.encode(plaintext) : plaintext;
-  const aadBytes = aad ? (typeof aad === "string" ? enc.encode(aad) : aad) : new Uint8Array(0);
-  const ciphertextWithTag = new Uint8Array(
+  const aadBytes = aad
+    ? (typeof aad === "string" ? enc.encode(aad) : aad)
+    : new Uint8Array(0);
+  const ct = new Uint8Array(
     await crypto.subtle.encrypt(
       { name: "AES-GCM", iv: nonce, additionalData: aadBytes, tagLength: 128 },
-      key,
-      ptBytes
+      key, ptBytes
     )
   );
-  return ciphertextWithTag; // last 16 bytes is the tag
+  return ct;
 }
 
-export async function decryptMessage(sessionKey, baseNonce, seq, ciphertextWithTag, aad) {
+export async function decryptMessage(sessionKey, baseNonce, seq, ct, aad) {
   const key = await importAESKey(sessionKey);
   const nonce = buildNonce(baseNonce, seq);
-  const aadBytes = aad ? (typeof aad === "string" ? enc.encode(aad) : aad) : new Uint8Array(0);
-  const plaintext = await crypto.subtle.decrypt(
+  const aadBytes = aad
+    ? (typeof aad === "string" ? enc.encode(aad) : aad)
+    : new Uint8Array(0);
+  const pt = await crypto.subtle.decrypt(
     { name: "AES-GCM", iv: nonce, additionalData: aadBytes, tagLength: 128 },
-    key,
-    ciphertextWithTag
+    key, ct
   );
-  return new Uint8Array(plaintext);
+  return new Uint8Array(pt);
 }
 
 export function bytesToString(bytes) {
@@ -181,22 +175,76 @@ export async function sha256(data) {
   return new Uint8Array(hash);
 }
 
-// ---------- Identity persistence (localStorage) ----------
+// ---------- Password wrapping (PBKDF2 → AES-GCM) ----------
+// Wrapped format: "salt:nonce:ciphertext" (all base64).
+// salt: 16 bytes random, nonce: 12 bytes random, ciphertext: AES-GCM output.
 
-const STORAGE_KEY = "zerodday.identity";
+const PBKDF2_ITERS = 200_000;
 
-export function saveIdentity(userId, identity) {
-  // Store secretKey + publicKey + userId — encrypted-at-rest would be production hardening
-  const data = {
+async function deriveAesKey(password, salt) {
+  const baseKey = await crypto.subtle.importKey(
+    "raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]
+  );
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt, iterations: PBKDF2_ITERS, hash: "SHA-256" },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+/**
+ * Wrap (encrypt) the 64-byte Ed25519 secret key with the user's password.
+ * Returns "salt:nonce:ciphertext" (base64), suitable for sending to server.
+ */
+export async function wrapSecretKey(secretKey, password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveAesKey(password, salt);
+  const ct = new Uint8Array(
+    await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, secretKey)
+  );
+  return [bytesToBase64(salt), bytesToBase64(nonce), bytesToBase64(ct)].join(":");
+}
+
+/**
+ * Unwrap (decrypt) the wrapped secret key with the password.
+ * Throws if password is wrong (GCM auth tag mismatch).
+ */
+export async function unwrapSecretKey(blob, password) {
+  const parts = blob.split(":");
+  if (parts.length !== 3) throw new Error("Malformed wrapped key");
+  const [saltB64, nonceB64, ctB64] = parts;
+  const key = await deriveAesKey(password, base64ToBytes(saltB64));
+  const pt = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: base64ToBytes(nonceB64) },
+    key,
+    base64ToBytes(ctB64)
+  );
+  return new Uint8Array(pt);
+}
+
+// ---------- Identity persistence (sessionStorage, dies with tab) ----------
+//
+// IMPORTANT: We only persist UNWRAPPED keys in sessionStorage during an active
+// tab session, so a page refresh doesn't kick the user back to login. The
+// authoritative storage is the SERVER (wrapped). localStorage is no longer
+// used for identity — it persists across browser restarts unencrypted, which
+// is exactly what we want to avoid now that the user has a password.
+
+const SESSION_KEY = "zerodday.identity";
+
+export function stashIdentity(userId, identity) {
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify({
     userId,
     secretKey: bytesToHex(identity.secretKey),
     publicKey: bytesToHex(identity.publicKey),
-  };
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  }));
 }
 
-export function loadIdentity() {
-  const raw = localStorage.getItem(STORAGE_KEY);
+export function loadStashedIdentity() {
+  const raw = sessionStorage.getItem(SESSION_KEY);
   if (!raw) return null;
   try {
     const data = JSON.parse(raw);
@@ -211,6 +259,9 @@ export function loadIdentity() {
   }
 }
 
-export function clearIdentity() {
-  localStorage.removeItem(STORAGE_KEY);
+export function clearStashedIdentity() {
+  sessionStorage.removeItem(SESSION_KEY);
+  // Also clear the legacy localStorage key from the old version, to migrate
+  // users cleanly off the unencrypted-at-rest storage.
+  localStorage.removeItem("zerodday.identity");
 }

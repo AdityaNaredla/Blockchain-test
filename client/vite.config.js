@@ -1,7 +1,11 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 
-// https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
-})
+  server: {
+    port: 5173,
+    // No proxy — we use VITE_API_URL with credentials: 'include'.
+    // The server allows the dev origin via ALLOWED_ORIGINS.
+  },
+});
