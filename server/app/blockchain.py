@@ -1,12 +1,18 @@
 """
 ZeroDay Blockchain — Persistent single-node chain backed by SQLite.
-Stores blocks for key registration, revocation, and document signatures.
+
+The chain itself is APPEND-ONLY and stores immutable public records:
+  - GENESIS, REGISTER, REVOKE, DOC_SIGNATURE
+
+Auth state (passwords, wrapped private keys, sessions) is mutable and lives
+in separate tables, NOT on the chain. The chain is still the source of truth
+for "what public key belongs to user X" — auth just protects key custody.
 """
 import sqlite3
 import hashlib
 import json
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 
@@ -30,7 +36,7 @@ class Block:
 
 
 class Blockchain:
-    """SQLite-backed append-only chain."""
+    """SQLite-backed append-only chain + auxiliary auth tables."""
 
     def __init__(self, db_path: str = "blockchain.db"):
         self.db_path = db_path
@@ -46,6 +52,7 @@ class Blockchain:
     def _init_db(self):
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as c:
+            # The chain itself — append-only, immutable
             c.execute("""
                 CREATE TABLE IF NOT EXISTS blocks (
                     idx INTEGER PRIMARY KEY,
@@ -53,6 +60,20 @@ class Blockchain:
                     payload TEXT NOT NULL,
                     previous_hash TEXT NOT NULL,
                     block_hash TEXT NOT NULL
+                )
+            """)
+            # Auth: password hashes + wrapped private keys.
+            # NOT on-chain — this is mutable per-user state.
+            # Wrapped key format: "salt:nonce:ciphertext" all base64,
+            # AES-GCM with key from PBKDF2(password, salt, 200k, sha256).
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS auth (
+                    user_id TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    wrapped_secret_key TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_login_at REAL
                 )
             """)
             c.commit()
@@ -82,13 +103,16 @@ class Blockchain:
         with self._conn() as c:
             c.execute(
                 "INSERT INTO blocks VALUES (?, ?, ?, ?, ?)",
-                (block.index, block.timestamp, json.dumps(block.payload), block.previous_hash, block.block_hash)
+                (block.index, block.timestamp, json.dumps(block.payload),
+                 block.previous_hash, block.block_hash)
             )
             c.commit()
 
     def _add_block(self, payload: dict) -> Block:
         with self._conn() as c:
-            prev_row = c.execute("SELECT * FROM blocks ORDER BY idx DESC LIMIT 1").fetchone()
+            prev_row = c.execute(
+                "SELECT * FROM blocks ORDER BY idx DESC LIMIT 1"
+            ).fetchone()
             prev = self._row_to_block(prev_row)
             block = Block(
                 index=prev.index + 1,
@@ -99,13 +123,15 @@ class Blockchain:
             block.block_hash = block.compute_hash()
             c.execute(
                 "INSERT INTO blocks VALUES (?, ?, ?, ?, ?)",
-                (block.index, block.timestamp, json.dumps(block.payload), block.previous_hash, block.block_hash)
+                (block.index, block.timestamp, json.dumps(block.payload),
+                 block.previous_hash, block.block_hash)
             )
             c.commit()
             return block
 
+    # ---------- Chain operations (public, on-chain) ----------
+
     def register_key(self, user_id: str, public_key_hex: str) -> Block:
-        """Register an Ed25519 public key on-chain."""
         return self._add_block({
             "type": "REGISTER",
             "user_id": user_id,
@@ -113,15 +139,14 @@ class Blockchain:
         })
 
     def revoke_key(self, user_id: str, public_key_hex: str) -> Block:
-        """Revoke a previously registered key."""
         return self._add_block({
             "type": "REVOKE",
             "user_id": user_id,
             "public_key": public_key_hex,
         })
 
-    def log_document_signature(self, signer_id: str, doc_hash_hex: str, signature_hex: str) -> Block:
-        """Log a document signature on-chain."""
+    def log_document_signature(self, signer_id: str, doc_hash_hex: str,
+                                signature_hex: str) -> Block:
         return self._add_block({
             "type": "DOC_SIGNATURE",
             "signer_id": signer_id,
@@ -130,11 +155,9 @@ class Blockchain:
         })
 
     def lookup_key(self, user_id: str) -> Optional[dict]:
-        """Find the latest active (non-revoked) key for a user."""
         latest_key = None
         latest_block = None
         revoked_keys = set()
-
         with self._conn() as c:
             for row in c.execute("SELECT * FROM blocks ORDER BY idx ASC"):
                 block = self._row_to_block(row)
@@ -145,7 +168,6 @@ class Blockchain:
                     elif p.get("type") == "REGISTER":
                         latest_key = p["public_key"]
                         latest_block = block
-
         if latest_key and latest_key not in revoked_keys:
             return {
                 "user_id": user_id,
@@ -156,7 +178,6 @@ class Blockchain:
         return None
 
     def list_users(self) -> list[dict]:
-        """List all registered (non-revoked) users."""
         active = {}
         revoked = set()
         with self._conn() as c:
@@ -180,7 +201,9 @@ class Blockchain:
     def is_key_revoked(self, public_key_hex: str) -> bool:
         with self._conn() as c:
             r = c.execute(
-                "SELECT 1 FROM blocks WHERE json_extract(payload, '$.type')='REVOKE' AND json_extract(payload, '$.public_key')=?",
+                "SELECT 1 FROM blocks WHERE "
+                "json_extract(payload, '$.type')='REVOKE' AND "
+                "json_extract(payload, '$.public_key')=?",
                 (public_key_hex,)
             ).fetchone()
             return r is not None
@@ -199,7 +222,6 @@ class Blockchain:
             ]
 
     def validate_chain(self) -> bool:
-        """Verify chain integrity end-to-end."""
         with self._conn() as c:
             rows = list(c.execute("SELECT * FROM blocks ORDER BY idx ASC"))
             for i in range(1, len(rows)):
@@ -214,10 +236,49 @@ class Blockchain:
     def stats(self) -> dict:
         with self._conn() as c:
             counts = {"REGISTER": 0, "REVOKE": 0, "DOC_SIGNATURE": 0, "GENESIS": 0}
-            for row in c.execute("SELECT json_extract(payload, '$.type') AS t, COUNT(*) AS c FROM blocks GROUP BY t"):
-                counts[row["t"]] = row["c"]
+            for row in c.execute(
+                "SELECT json_extract(payload, '$.type') AS t, COUNT(*) AS c "
+                "FROM blocks GROUP BY t"
+            ):
+                t = row["t"]
+                if t in counts:
+                    counts[t] = row["c"]
             return {
                 "total_blocks": self._block_count(),
                 "by_type": counts,
                 "valid": self.validate_chain(),
             }
+
+    # ---------- Auth operations (off-chain, mutable) ----------
+
+    def create_auth(self, user_id: str, password_hash: str,
+                    wrapped_secret_key: str, public_key_hex: str) -> None:
+        """Store auth record. Caller is responsible for not duplicating
+        an already-registered user_id (lookup_key check)."""
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO auth (user_id, password_hash, wrapped_secret_key, "
+                "public_key, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, password_hash, wrapped_secret_key,
+                 public_key_hex, time.time())
+            )
+            c.commit()
+
+    def get_auth(self, user_id: str) -> Optional[dict]:
+        with self._conn() as c:
+            r = c.execute(
+                "SELECT user_id, password_hash, wrapped_secret_key, public_key, "
+                "created_at, last_login_at FROM auth WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
+            if not r:
+                return None
+            return dict(r)
+
+    def touch_login(self, user_id: str) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE auth SET last_login_at=? WHERE user_id=?",
+                (time.time(), user_id)
+            )
+            c.commit()
