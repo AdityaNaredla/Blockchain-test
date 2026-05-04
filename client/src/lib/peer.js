@@ -185,12 +185,33 @@ export class PeerManager {
       this.log("INFO", `[${peerId}] connection state: ${pc.connectionState}`);
       if (pc.connectionState === "connected") {
         this.emit("peerConnected", peerId);
+      } else if (pc.connectionState === "failed") {
+        // ICE failed — almost always a NAT traversal problem.
+        const hasTurn = RTC_CONFIG.iceServers.some(s =>
+          (Array.isArray(s.urls) ? s.urls : [s.urls])
+            .some(u => typeof u === "string" && u.startsWith("turn"))
+        );
+        this.log("ERROR",
+          `[${peerId}] connection failed — no working network path between peers`,
+          hasTurn
+            ? "TURN server is configured but couldn't establish relay. Check TURN credentials."
+            : "No TURN server configured. STUN-only doesn't work across symmetric NATs (corporate / cellular / restrictive WiFi). Set VITE_TURN_URL/USERNAME/CREDENTIAL and redeploy."
+        );
+        this.emit("peerDisconnected", peerId);
       } else if (
         pc.connectionState === "disconnected" ||
-        pc.connectionState === "failed" ||
         pc.connectionState === "closed"
       ) {
         this.emit("peerDisconnected", peerId);
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      // ICE state often transitions to "checking" → "connected" or "checking"
+      // → "failed". Only log the interesting transitions; the whole list is
+      // available in chrome://webrtc-internals.
+      if (pc.iceConnectionState === "failed") {
+        this.log("WARN", `[${peerId}] ICE failed — open chrome://webrtc-internals for details`);
       }
     };
 
